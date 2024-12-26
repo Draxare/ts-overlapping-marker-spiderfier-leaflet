@@ -57,12 +57,12 @@ class OverlappingMarkerSpiderfier {
       });
     }
 
-    addMarker(marker: ExtendedMarker): this {
+    async addMarker(marker: ExtendedMarker): Promise<this> {
       if (marker._oms) {
         return this;
       }
       marker._oms = true;
-      const markerListener: L.LeafletEventHandlerFn = (event) => this.spiderListener(event.target);
+      const markerListener = (event: L.LeafletEvent): Promise<void> => this.spiderListener(event.target);
       marker.addEventListener('click', markerListener);
       this.markerListeners.push({ marker, listener: markerListener });
       this.markers.push(marker);
@@ -73,30 +73,37 @@ class OverlappingMarkerSpiderfier {
       return [...this.markers];
     }
 
-    removeMarker(marker: ExtendedMarker): this {
+    async removeMarker(marker: ExtendedMarker): Promise<this> {
       if (marker._omsData) {
-        this.unspiderfy();
+        await this.unspiderfy();
       }
+
       const i = this.arrIndexOf(this.markers, marker);
       if (i < 0) {
         return this;
       }
+
       const markerListener = this.markerListeners.find(m => m.marker === marker);
       if (markerListener) {
         marker.removeEventListener('click', markerListener.listener);
         this.markerListeners = this.markerListeners.filter(m => m !== markerListener);
       }
+
       delete marker._oms;
       this.markers.splice(i, 1);
       return this;
     }
 
-    clearMarkers(): this {
-      this.unspiderfy();
-      for (const { marker, listener } of this.markerListeners) {
-        marker.removeEventListener('click', listener);
-        delete marker._oms;
-      }
+    async clearMarkers(): Promise<this> {
+      await this.unspiderfy();
+
+      await Promise.all(
+        this.markerListeners.map(async ({ marker, listener }) => {
+          marker.removeEventListener('click', listener);
+          delete marker._oms;
+        }),
+      );
+
       this.initMarkerArrays();
       return this;
     }
@@ -119,35 +126,54 @@ class OverlappingMarkerSpiderfier {
       return this;
     }
 
-    unspiderfy(markerNotToMove: ExtendedMarker | null = null): this {
+    async unspiderfy(markerNotToMove: ExtendedMarker | null = null): Promise<this> {
       if (!this.spiderfied || this.unspiderfying) {
         return this;
       }
       this.unspiderfying = true;
 
-      const unspiderfiedMarkers: ExtendedMarker[] = [];
-      const nonNearbyMarkers: ExtendedMarker[] = [];
-      for (const marker of this.markers) {
-        if (marker._omsData) {
-          this.map.removeLayer(marker._omsData.leg);
-          if (marker !== markerNotToMove) { marker.setLatLng(marker._omsData.usualPosition); }
-          marker.setZIndexOffset(0);
-          const mhl = marker._omsData.highlightListeners;
-          if (mhl) {
-            marker.removeEventListener('mouseover', mhl.highlight);
-            marker.removeEventListener('mouseout', mhl.unhighlight);
-          }
-          delete marker._omsData;
-          unspiderfiedMarkers.push(marker);
-        } else {
-          nonNearbyMarkers.push(marker);
-        }
+      try {
+        const unspiderfiedMarkers: ExtendedMarker[] = [];
+        const nonNearbyMarkers: ExtendedMarker[] = [];
+
+        await Promise.all(
+          this.markers.map(async (marker) => {
+            if (marker._omsData) {
+              await this.unspiderfyMarker(marker, markerNotToMove);
+              unspiderfiedMarkers.push(marker);
+            } else {
+              nonNearbyMarkers.push(marker);
+            }
+          }),
+        );
+
+        this.spiderfied = false;
+        await this.trigger('unspiderfy', unspiderfiedMarkers, nonNearbyMarkers);
+        return this;
+      } finally {
+        this.unspiderfying = false;
+      }
+    }
+
+    private async unspiderfyMarker(marker: ExtendedMarker, markerNotToMove: ExtendedMarker | null): Promise<void> {
+      await new Promise<void>(resolve => {
+        this.map.removeLayer(marker._omsData!.leg);
+        resolve();
+      });
+
+      if (marker !== markerNotToMove) {
+        marker.setLatLng(marker._omsData!.usualPosition);
       }
 
-      this.spiderfied = false;
-      this.unspiderfying = false;
-      this.trigger('unspiderfy', unspiderfiedMarkers, nonNearbyMarkers);
-      return this;
+      marker.setZIndexOffset(0);
+
+      const mhl = marker._omsData!.highlightListeners;
+      if (mhl) {
+        marker.removeEventListener('mouseover', mhl.highlight);
+        marker.removeEventListener('mouseout', mhl.unhighlight);
+      }
+
+      delete marker._omsData;
     }
 
     private initMarkerArrays(): void {
@@ -155,8 +181,12 @@ class OverlappingMarkerSpiderfier {
       this.markerListeners = [];
     }
 
-    private trigger<eventName extends keyof SpiderfierEventMap>(event: eventName, ...args: SpiderfierEventMap[eventName]): void {
-      (this.listeners[event] || []).forEach(func => (func as (...args: SpiderfierEventMap[eventName]) => void)(...args));
+    private async trigger<eventName extends keyof SpiderfierEventMap>(event: eventName, ...args: SpiderfierEventMap[eventName]): Promise<void> {
+      await Promise.all(
+        (this.listeners[event] || []).map(async (func) => {
+          await (func as (...args: SpiderfierEventMap[eventName]) => void | Promise<void>)(...args);
+        }),
+      );
     }
 
     private generatePtsCircle(count: number, centerPt: L.Point): L.Point[] {
@@ -186,27 +216,45 @@ class OverlappingMarkerSpiderfier {
       });
     }
 
-    private spiderListener(marker: ExtendedMarker): void {
+    private async spiderListener(marker: ExtendedMarker): Promise<void> {
       const markerSpiderfied = marker._omsData;
 
       if (!markerSpiderfied || !this.keepSpiderfied) {
-        this.unspiderfy();
+        await this.unspiderfy();
       }
+
       if (markerSpiderfied) {
-        this.trigger('click', marker);
+        await this.trigger('click', marker);
       } else {
         if (this.spiderfying) {
           return;
         }
         this.spiderfying = true;
 
-        const nearbyMarkerData: MarkerData[] = [];
-        const nonNearbyMarkers: ExtendedMarker[] = [];
-        const pxSq = this.nearbyDistance * this.nearbyDistance;
-        const markerPt = this.map.latLngToLayerPoint(marker.getLatLng());
-        for (const m of this.markers) {
+        try {
+          const { nearbyMarkerData, nonNearbyMarkers } = await this.getNearbyMarkers(marker);
+
+          if (nearbyMarkerData.length === 1) {
+            await this.trigger('click', marker);
+          } else {
+            await this.spiderfy(nearbyMarkerData, nonNearbyMarkers);
+          }
+        } finally {
+          this.spiderfying = false;
+        }
+      }
+    }
+
+    private async getNearbyMarkers(marker: ExtendedMarker): Promise<{nearbyMarkerData: MarkerData[]; nonNearbyMarkers: ExtendedMarker[]}> {
+      const nearbyMarkerData: MarkerData[] = [];
+      const nonNearbyMarkers: ExtendedMarker[] = [];
+      const pxSq = this.nearbyDistance * this.nearbyDistance;
+      const markerPt = this.map.latLngToLayerPoint(marker.getLatLng());
+
+      await Promise.all(
+        this.markers.map(async (m) => {
           if (!this.map.hasLayer(m)) {
-            continue;
+            return;
           }
           const mPt = this.map.latLngToLayerPoint(m.getLatLng());
           if (this.ptDistanceSq(mPt, markerPt) < pxSq) {
@@ -214,15 +262,10 @@ class OverlappingMarkerSpiderfier {
           } else {
             nonNearbyMarkers.push(m);
           }
-        }
-        if (nearbyMarkerData.length === 1) {
-          this.trigger('click', marker);
-        } else {
-          this.spiderfy(nearbyMarkerData, nonNearbyMarkers);
-        }
+        }),
+      );
 
-        this.spiderfying = false;
-      }
+      return { nearbyMarkerData, nonNearbyMarkers };
     }
 
     private makeHighlightListeners(marker: ExtendedMarker): { highlight: () => void; unhighlight: () => void } {
@@ -232,37 +275,56 @@ class OverlappingMarkerSpiderfier {
       };
     }
 
-    private spiderfy(markerData: MarkerData[], nonNearbyMarkers: ExtendedMarker[]): void {
+    private async spiderfy(markerData: MarkerData[], nonNearbyMarkers: ExtendedMarker[]): Promise<void> {
       this.spiderfying = true;
-      const numFeet = markerData.length;
-      const bodyPt = this.ptAverage(markerData.map(md => md.markerPt));
-      const footPts = numFeet >= this.circleSpiralSwitchover
-        ? this.generatePtsSpiral(numFeet, bodyPt).reverse()
-        : this.generatePtsCircle(numFeet, bodyPt);
-      const spiderfiedMarkers = footPts.map(footPt => {
-        const footLl = this.map.layerPointToLatLng(footPt);
-        const nearestMarkerDatum = this.minExtract(markerData, md => this.ptDistanceSq(md.markerPt, footPt));
-        const marker = nearestMarkerDatum.marker;
-        const leg = new L.Polyline([marker.getLatLng(), footLl], {
-          color: this.legColors.usual,
-          weight: this.legWeight,
-          interactive: false,
-        });
-        this.map.addLayer(leg);
-        marker._omsData = { usualPosition: marker.getLatLng(), leg: leg };
-        if (this.legColors.highlighted !== this.legColors.usual) {
-          const mhl = this.makeHighlightListeners(marker);
-          marker._omsData.highlightListeners = mhl;
-          marker.addEventListener('mouseover', mhl.highlight);
-          marker.addEventListener('mouseout', mhl.unhighlight);
-        }
-        marker.setLatLng(footLl);
-        marker.setZIndexOffset(1000000);
-        return marker;
+
+      try {
+        const numFeet = markerData.length;
+        const bodyPt = this.ptAverage(markerData.map(md => md.markerPt));
+        const footPts = numFeet >= this.circleSpiralSwitchover
+          ? this.generatePtsSpiral(numFeet, bodyPt).reverse()
+          : this.generatePtsCircle(numFeet, bodyPt);
+
+        const spiderfiedMarkers = await Promise.all(
+          footPts.map(async (footPt) => {
+            const footLl = this.map.layerPointToLatLng(footPt);
+            const nearestMarkerDatum = this.minExtract(markerData, md =>
+              this.ptDistanceSq(md.markerPt, footPt));
+            return this.setupSpiderfiedMarker(nearestMarkerDatum.marker, footLl);
+          }),
+        );
+
+        this.spiderfied = true;
+        await this.trigger('spiderfy', spiderfiedMarkers, nonNearbyMarkers);
+      } finally {
+        this.spiderfying = false;
+      }
+    }
+
+    private async setupSpiderfiedMarker(marker: ExtendedMarker, footLl: L.LatLng): Promise<ExtendedMarker> {
+      const leg = new L.Polyline([marker.getLatLng(), footLl], {
+        color: this.legColors.usual,
+        weight: this.legWeight,
+        interactive: false,
       });
-      this.spiderfying = false;
-      this.spiderfied = true;
-      this.trigger('spiderfy', spiderfiedMarkers, nonNearbyMarkers);
+
+      await new Promise<void>(resolve => {
+        this.map.addLayer(leg);
+        resolve();
+      });
+
+      marker._omsData = { usualPosition: marker.getLatLng(), leg };
+
+      if (this.legColors.highlighted !== this.legColors.usual) {
+        const mhl = this.makeHighlightListeners(marker);
+        marker._omsData.highlightListeners = mhl;
+        marker.addEventListener('mouseover', mhl.highlight);
+        marker.addEventListener('mouseout', mhl.unhighlight);
+      }
+
+      marker.setLatLng(footLl);
+      marker.setZIndexOffset(1000000);
+      return marker;
     }
 
     private ptDistanceSq(pt1: L.Point, pt2: L.Point): number {
